@@ -54,30 +54,27 @@ function buildRss(articles) {
       <link>${escapeXml(a.link)}</link>
       <guid isPermaLink="true">${escapeXml(a.link)}</guid>
       <pubDate>${new Date(a.date).toUTCString()}</pubDate>
-      <description>${escapeXml(a.description || '')}</description>
+      ${a.tag ? `<category>${escapeXml(a.tag)}</category>` : ''}
+      <description>${escapeXml((a.content || '').slice(0, 500))}</description>
+      <content:encoded><![CDATA[${a.content || ''}]]></content:encoded>
       ${a.image ? `<enclosure url="${escapeXml(a.image)}" type="image/jpeg" />` : ''}
     </item>`).join('\n');
 
   return `<?xml version="1.0" encoding="UTF-8"?>
-<rss version="2.0">
+<rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/">
   <channel>
     <title>Rockstar Games Newswire (unofficial mirror)</title>
     <link>${NEWSWIRE_URL}</link>
-    <description>Auto-generated mirror of the Rockstar Newswire, rebuilt because Rockstar retired their public RSS feed.</description>
+    <description>Auto-generated mirror of the Rockstar Newswire, rebuilt because Rockstar retired their public RSS feed. Full article text included, scraped directly from each article page.</description>
     <lastBuildDate>${new Date().toUTCString()}</lastBuildDate>
 ${items}
   </channel>
 </rss>`;
 }
 
-async function discoverAndFetch() {
-  const browser = await puppeteer.launch({
-    headless: 'new',
-    args: ['--no-sandbox', '--disable-setuid-sandbox']
-  });
-
+async function discoverAndFetch(browser) {
+  const page = await browser.newPage();
   try {
-    const page = await browser.newPage();
     const capturedUrls = new Set();
 
     page.on('request', req => {
@@ -154,7 +151,7 @@ async function discoverAndFetch() {
 
     return { hash: winningUrl, articles };
   } finally {
-    await browser.close();
+    await page.close();
   }
 }
 
@@ -164,42 +161,118 @@ function extractArticles(data) {
     data?.data?.newswires?.results,
     data?.data?.newswireFeed?.items,
     data?.data?.newswire?.results,
+    data?.data?.newswire?.posts?.results,
     data?.data?.articles?.results,
     data?.data?.posts?.results
   ].filter(Boolean);
 
   for (const c of candidates) {
-    if (Array.isArray(c) && c.length && (c[0].title || c[0].subtitle) && (c[0].url || c[0].link)) {
-      return c.map(a => ({
-        title: a.title || a.subtitle || 'Untitled',
-        link: (a.url || a.link || '').startsWith('http') ? (a.url || a.link) : `https://www.rockstargames.com${a.url || a.link || ''}`,
-        date: a.publishTime || a.date || Date.now(),
-        description: a.subtitle || a.description || '',
-        image: a.image?.social?.url || a.image?.default?.url || null
-      }));
+    if (Array.isArray(c) && c.length && c[0].title && (c[0].url || c[0].link)) {
+      return c.map(a => {
+        const rawUrl = a.url || a.link || '';
+        const image =
+          a.preview_images_parsed?.newswire_block?.d16x9 ||
+          a.preview_images_parsed?.newswire_block?.square ||
+          a.image?.social?.url ||
+          a.image?.default?.url ||
+          null;
+        return {
+          id: a.id || rawUrl,
+          title: a.title,
+          link: rawUrl.startsWith('http') ? rawUrl : `https://www.rockstargames.com${rawUrl}`,
+          date: a.created || a.publishTime || a.date || Date.now(),
+          tag: a.primary_tags?.[0]?.name || null,
+          image
+        };
+      });
     }
   }
   return [];
 }
 
+async function fetchArticleBody(page, url) {
+  await page.goto(url, { waitUntil: 'networkidle2', timeout: 45000 });
+  await new Promise(r => setTimeout(r, 1500));
+
+  const text = await page.evaluate(() => {
+    const selectors = [
+      'article',
+      '[class*="ArticleContent"]',
+      '[class*="article-content"]',
+      '[class*="PostContent"]',
+      '[class*="post-content"]',
+      'main'
+    ];
+    for (const sel of selectors) {
+      const el = document.querySelector(sel);
+      if (el && el.innerText && el.innerText.trim().length > 200) {
+        return el.innerText.trim();
+      }
+    }
+    // Fallback: whole body text, trimmed of obvious nav/footer noise later
+    return document.body ? document.body.innerText.trim() : '';
+  });
+
+  return text;
+}
+
 async function main() {
   fs.mkdirSync(path.dirname(OUTPUT_PATH), { recursive: true });
   const state = loadState();
+  const cache = state.cache || {}; // id -> { content, cachedAt }
+
+  const browser = await puppeteer.launch({
+    headless: 'new',
+    args: ['--no-sandbox', '--disable-setuid-sandbox']
+  });
 
   try {
-    const { hash, articles } = await discoverAndFetch();
+    const { hash, articles } = await discoverAndFetch(browser);
+
+    const page = await browser.newPage();
+    for (const a of articles) {
+      if (cache[a.id]?.content) {
+        a.content = cache[a.id].content;
+        continue;
+      }
+      try {
+        const body = await fetchArticleBody(page, a.link);
+        if (body && body.length > 100) {
+          a.content = body;
+          cache[a.id] = { content: body, cachedAt: new Date().toISOString(), title: a.title, link: a.link };
+        } else {
+          a.content = '(Could not extract full article text — view the article at the link above.)';
+        }
+      } catch (e) {
+        console.error(`Failed to fetch body for ${a.link}:`, e.message);
+        a.content = '(Could not extract full article text — view the article at the link above.)';
+      }
+    }
+    await page.close();
+
+    // Trim cache to just the articles currently in the feed, so it doesn't
+    // grow forever, but keep a little headroom for recently-dropped ones.
+    const currentIds = new Set(articles.map(a => a.id));
+    const trimmedCache = {};
+    for (const id of currentIds) if (cache[id]) trimmedCache[id] = cache[id];
+
     const rss = buildRss(articles);
     fs.writeFileSync(OUTPUT_PATH, rss);
-    saveState({ lastHash: hash, lastArticles: articles.map(a => a.link), lastSuccess: new Date().toISOString() });
-    console.log(`OK: wrote ${articles.length} articles to ${OUTPUT_PATH}`);
+    saveState({
+      lastHash: hash,
+      lastArticles: articles.map(a => a.link),
+      lastSuccess: new Date().toISOString(),
+      cache: trimmedCache
+    });
+    console.log(`OK: wrote ${articles.length} articles (with full body text) to ${OUTPUT_PATH}`);
   } catch (err) {
     console.error('Tracker run failed:', err.message);
-    // Don't wipe out a previously-good feed.xml on a transient failure —
-    // just leave the last successful build in place.
     if (!fs.existsSync(OUTPUT_PATH)) {
       fs.writeFileSync(OUTPUT_PATH, buildRss([]));
     }
     process.exitCode = 1;
+  } finally {
+    await browser.close();
   }
 }
 
