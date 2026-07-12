@@ -213,7 +213,22 @@ async function fetchArticleBody(page, url) {
     return document.body ? document.body.innerText.trim() : '';
   });
 
-  return text;
+  return cleanArticleText(text);
+}
+
+function cleanArticleText(text) {
+  if (!text) return text;
+  // Rockstar's article pages always end with this fixed boilerplate block,
+  // in this order: "(Opens in a new window)" -> ESRB rating descriptors ->
+  // "In-Game Purchases, Users Interact" -> "Related Stories" -> more links.
+  // Cutting at the first marker removes the whole trailing block in one go.
+  const cutMarkers = ['(Opens in a new window)', 'Related Stories'];
+  let cutIndex = text.length;
+  for (const marker of cutMarkers) {
+    const idx = text.indexOf(marker);
+    if (idx !== -1 && idx < cutIndex) cutIndex = idx;
+  }
+  return text.slice(0, cutIndex).trim();
 }
 
 async function main() {
