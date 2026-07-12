@@ -78,71 +78,108 @@ async function discoverAndFetch() {
 
   try {
     const page = await browser.newPage();
-    let captured = null;
+    const capturedUrls = new Set();
 
     page.on('request', req => {
       const url = req.url();
-      if (url.includes('graph.rockstargames.com') && url.includes('persistedQuery')) {
-        if (!captured) captured = url;
-      }
-    });
-
-    // Also catch GraphQL calls made via POST body (some newswire builds do this)
-    page.on('requestfinished', async req => {
-      const url = req.url();
-      if (url.includes('graph.rockstargames.com') && !captured) {
-        captured = url;
+      if (url.includes('graph.rockstargames.com')) {
+        capturedUrls.add(url);
       }
     });
 
     await page.goto(NEWSWIRE_URL, { waitUntil: 'networkidle2', timeout: 45000 });
-    // Give lazy-loaded requests a moment to fire
-    await new Promise(r => setTimeout(r, 4000));
+    // Give lazy-loaded requests a moment to fire (newswire list often loads
+    // slightly after the initial translations/nav calls)
+    await new Promise(r => setTimeout(r, 6000));
 
-    if (!captured) {
-      throw new Error('Could not capture a graph.rockstargames.com request — Rockstar may have changed how the newswire loads its data.');
+    if (!capturedUrls.size) {
+      throw new Error('Could not capture any graph.rockstargames.com requests — Rockstar may have changed how the newswire loads its data.');
     }
 
-    const res = await page.evaluate(async (capturedUrl) => {
-      const r = await fetch(capturedUrl, { credentials: 'omit' });
-      return { status: r.status, body: await r.text() };
-    }, captured);
+    // Prefer URLs whose operationName looks newswire/article related, but
+    // fall back to checking every captured call if none match by name.
+    const urls = [...capturedUrls];
+    const prioritized = [
+      ...urls.filter(u => /newswire|article|tag|post/i.test(u)),
+      ...urls.filter(u => !/newswire|article|tag|post/i.test(u))
+    ];
 
-    if (res.status !== 200) {
-      throw new Error(`Captured GraphQL URL returned HTTP ${res.status}`);
+    let articles = [];
+    let winningUrl = null;
+    let debugSamples = [];
+
+    for (const candidateUrl of prioritized) {
+      const res = await page.evaluate(async (u) => {
+        try {
+          const r = await fetch(u, { credentials: 'omit' });
+          return { status: r.status, body: await r.text() };
+        } catch (e) {
+          return { status: 0, body: '' };
+        }
+      }, candidateUrl);
+
+      if (res.status !== 200 || !res.body) continue;
+
+      let data;
+      try {
+        data = JSON.parse(res.body);
+      } catch {
+        continue;
+      }
+
+      const found = extractArticles(data);
+      if (found.length) {
+        articles = found;
+        winningUrl = candidateUrl;
+        break;
+      }
+
+      debugSamples.push({
+        url: candidateUrl,
+        dataKeys: Object.keys(data?.data || {}),
+        sample: JSON.stringify(data).slice(0, 800)
+      });
     }
 
-    const data = JSON.parse(res.body);
-    const rawArticles =
-      data?.data?.tag?.newswires?.results ||
-      data?.data?.newswires?.results ||
-      data?.data?.newswireFeed?.items ||
-      [];
-
-    if (!rawArticles.length) {
-      console.error('--- DEBUG: captured URL ---');
-      console.error(captured);
-      console.error('--- DEBUG: top-level response keys ---');
-      console.error(JSON.stringify(Object.keys(data || {})));
-      console.error('--- DEBUG: data.data keys (if present) ---');
-      console.error(JSON.stringify(Object.keys(data?.data || {})));
-      console.error('--- DEBUG: full response (truncated to 3000 chars) ---');
-      console.error(JSON.stringify(data).slice(0, 3000));
-      throw new Error('GraphQL response parsed but no articles were found — response shape may have changed. See DEBUG output above.');
+    if (!articles.length) {
+      console.error('--- DEBUG: no article-shaped response found among', prioritized.length, 'captured GraphQL calls ---');
+      for (const s of debugSamples) {
+        console.error('URL:', s.url);
+        console.error('data keys:', JSON.stringify(s.dataKeys));
+        console.error('sample:', s.sample);
+        console.error('---');
+      }
+      throw new Error('None of the captured GraphQL responses contained article-shaped data. See DEBUG output above.');
     }
 
-    const articles = rawArticles.map(a => ({
-      title: a.title || a.subtitle || 'Untitled',
-      link: a.url ? `https://www.rockstargames.com${a.url}` : NEWSWIRE_URL,
-      date: a.publishTime || a.date || Date.now(),
-      description: a.subtitle || a.description || '',
-      image: a.image?.social?.url || a.image?.default?.url || null
-    }));
-
-    return { hash: captured, articles };
+    return { hash: winningUrl, articles };
   } finally {
     await browser.close();
   }
+}
+
+function extractArticles(data) {
+  const candidates = [
+    data?.data?.tag?.newswires?.results,
+    data?.data?.newswires?.results,
+    data?.data?.newswireFeed?.items,
+    data?.data?.newswire?.results,
+    data?.data?.articles?.results,
+    data?.data?.posts?.results
+  ].filter(Boolean);
+
+  for (const c of candidates) {
+    if (Array.isArray(c) && c.length && (c[0].title || c[0].subtitle) && (c[0].url || c[0].link)) {
+      return c.map(a => ({
+        title: a.title || a.subtitle || 'Untitled',
+        link: (a.url || a.link || '').startsWith('http') ? (a.url || a.link) : `https://www.rockstargames.com${a.url || a.link || ''}`,
+        date: a.publishTime || a.date || Date.now(),
+        description: a.subtitle || a.description || '',
+        image: a.image?.social?.url || a.image?.default?.url || null
+      }));
+    }
+  }
+  return [];
 }
 
 async function main() {
