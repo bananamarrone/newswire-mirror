@@ -120,7 +120,15 @@ async function discoverAndFetch() {
       [];
 
     if (!rawArticles.length) {
-      throw new Error('GraphQL response parsed but no articles were found — response shape may have changed.');
+      console.error('--- DEBUG: captured URL ---');
+      console.error(captured);
+      console.error('--- DEBUG: top-level response keys ---');
+      console.error(JSON.stringify(Object.keys(data || {})));
+      console.error('--- DEBUG: data.data keys (if present) ---');
+      console.error(JSON.stringify(Object.keys(data?.data || {})));
+      console.error('--- DEBUG: full response (truncated to 3000 chars) ---');
+      console.error(JSON.stringify(data).slice(0, 3000));
+      throw new Error('GraphQL response parsed but no articles were found — response shape may have changed. See DEBUG output above.');
     }
 
     const articles = rawArticles.map(a => ({
