@@ -1,0 +1,12 @@
+{
+  "name": "rockstar-newswire-tracker",
+  "version": "1.0.0",
+  "description": "Rebuilds Rockstar Newswire as an RSS feed using a headless browser, since Rockstar retired its public RSS feed.",
+  "main": "tracker.js",
+  "scripts": {
+    "start": "node tracker.js"
+  },
+  "dependencies": {
+    "puppeteer": "^22.0.0"
+  }
+}
